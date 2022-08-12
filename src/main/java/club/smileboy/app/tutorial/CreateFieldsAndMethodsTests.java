@@ -2,17 +2,17 @@ package club.smileboy.app.tutorial;
 
 import club.smileboy.app.method.proxy.Foo;
 import net.bytebuddy.ByteBuddy;
-import net.bytebuddy.dynamic.loading.ClassLoadingStrategy;
-import net.bytebuddy.dynamic.scaffold.subclass.ConstructorStrategy;
 import net.bytebuddy.implementation.FixedValue;
 import net.bytebuddy.implementation.MethodDelegation;
+import net.bytebuddy.implementation.bind.annotation.BindingPriority;
+import net.bytebuddy.implementation.bind.annotation.Pipe;
+import net.bytebuddy.implementation.bind.annotation.Super;
 import net.bytebuddy.implementation.bind.annotation.SuperCall;
 import org.junit.jupiter.api.Test;
 
+import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Modifier;
-import java.util.Arrays;
 import java.util.List;
-import java.util.concurrent.Callable;
 
 import static net.bytebuddy.matcher.ElementMatchers.*;
 
@@ -194,6 +194,7 @@ public class CreateFieldsAndMethodsTests {
      * 除了这4个注解,还有两种额外的预定义注解 能够授权访问动态类型的超类实现方法 ... 这种方式是,举个例子你能够增加一个切面到一个类(例如日志记录方法调用,使用@SuperCall 注解,一个超类实现的方法调用能够执行,即使它来自动态类外部 ...
      *
      * 在实际测试的过程中,发现了一个问题 , 对应的issues在 https://github.com/raphw/byte-buddy/issues/199 ...
+     * // 但是这个有点坑,还是需要 修饰符为 public
      *
      * 同样,注意到 @SuperCall 注解也能够使用在Runnable上,如果原始的方法返回值为空(那么可以丢弃掉) ...
      */
@@ -211,34 +212,206 @@ public class CreateFieldsAndMethodsTests {
 
     }
 
+    /**
+     * 你可能还是想要支持 这些辅助类型为什么能够调用其他类型的父类方法(这通常在Java中是完全屏蔽的,不可取) ..
+     * 它到底是如何做的 ...
+     * 本质上它如下:
+     *  class LoggingMemoryDatabase extends MemoryDatabase {
+     *
+     *   private class LoadMethodSuperCall implements Callable {
+     *
+     *     private final String info;
+     *     private LoadMethodSuperCall(String info) {
+     *       this.info = info;
+     *     }
+     *
+     *     @Override
+     *     public Object call() throws Exception {
+     *       return LoggingMemoryDatabase.super.load(info);
+     *     }
+     *   }
+     *
+     *   @Override
+     *   public List<String> load(String info) {
+     *     return LoggerInterceptor.log(new LoadMethodSuperCall(info));
+     *   }
+     * }
+     *
+     * 有些时候,
+     *
+     * @throws InstantiationException
+     * @throws IllegalAccessException
+     * @throws NoSuchMethodException
+     * @throws InvocationTargetException
+     */
     @Test
-    public void imitateConstructor() throws InstantiationException, IllegalAccessException {
+    public void imitateConstructor() throws InstantiationException, IllegalAccessException, NoSuchMethodException, InvocationTargetException {
         new ByteBuddy()
                 // 伪造超类 open
-                .subclass(RunnerSource.class,ConstructorStrategy.Default.IMITATE_SUPER_CLASS_OPENING)
+                .subclass(RunnerSource.class)
                 .method(named("printf"))
                 .intercept(MethodDelegation.to(RunnerTarget.class))
                 .make()
                 .load(getClass().getClassLoader())
                 .getLoaded()
+                .getDeclaredConstructor()
                 .newInstance()
-                .printf("data");
+                .printf("你好");
     }
 
 
 
 
-    static class RunnerSource {
+    public static class RunnerSource {
 
         public void printf(String data) {
-            //
+            System.out.println("父类实现 ...");
         }
     }
 
-    static class RunnerTarget {
+    public static class RunnerTarget {
 
-        public static void invoke(String data) {
-            System.out.println("display result: " + data);
+        public static void invoke(@SuperCall Runnable runnable) {
+            System.out.println("调用父类实现方法");
+            runnable.run();
+            System.out.println("调用结束");
+        }
+    }
+
+    static class ChangingLoggerInterceptor {
+        public static List<String> log(String info, @Super MemoryDatabase zuper) {
+            System.out.println("Calling database");
+            try {
+                return zuper.load(info + " (logged access)");
+            } finally {
+                System.out.println("Returned from database");
+            }
+        }
+    }
+
+    /**
+     * 有时候我们想要调用父类中的不同参数的方法来表示原始方法的调用 ..
+     * 通过@Super注解,byteBuddy 将会创建辅助类 它们会继承超类或者动态类型的接口,然后 覆盖动态类型中的所有方法去调用父类实现 ...
+     *
+     * class ChangingLoggerInterceptor {
+     *             public static List<String> log(String info, @Super MemoryDatabase zuper) {
+     *                 System.out.println("Calling database");
+     *                 try {
+     *                     return zuper.load(info + " (logged access)");
+     *                 } finally {
+     *                     System.out.println("Returned from database");
+     *                 }
+     *             }
+     *         }
+     *     }
+     *
+     *     现在这个被@Super 注解的参数是实际动态类型的实例的不同的身份 ..
+     *     参数访问实例的字段并不 反应实际的实例字段 .. 辅助实例的不可覆盖方法 不会代理它们执行(代理到父类方法执行),而是保留原始实现,
+     *     这可能导致慌缪的行为, 最终带有@Super 的注解的参数 并不是相关动态类型的超类(那么它们也不会作为任何方法的绑定实现)
+     *
+     *     由于这个@Super 它可以使用到任何的类型上,那么它可能需要提供一些信息用来构建实例 ..
+     *     默认情况byteBuddy将会尝试使用类的默认构造器,总是对于隐式继承Object类型的接口这样做,然而当继承的是一个动态类型的父类,
+     *     它有可能没有提供这个默认的构造器,这种情况下(或者我们可以使用指定的构造器时用来创建这样的辅助类型),@Super注解允许标识一个不同的构造器
+     *     通过使用这个注解的constructorParameters设置 构造器的参数信息 .. 这个构造器将会在创建的时候调用并将对应的默认值分配到每一个参数 ..
+     *
+     *     除此之外,同样可以使用Super.Instantiation.UNSAFE 策略 用来创建类(它通过使用java 的内部类而需要调用 任何 的构造器来创建辅助类型) ..
+     *     但是这个策略不兼容非Oracle得jvm 可能在未来也不再支持,但是目前而言,大多数jvm实现都能找到这个不安全得实现策略 ...
+     *
+     *     我们可以知道LoggerInterceptor 它声明了一个检查异常 ... 但是原始方法没有声明任何检查异常,通常 java 编译器将拒绝编译这样的调用 ...
+     *     但是对比编译器,java 运行时不会将检查异常和它们的检查异常区别对待并允许这个调用 ..
+     *     但是当我们抛出 未声明的异常需要注意,不应该让用户疑惑 ...
+     */
+    @Test
+    public void SuperOverrideMethodInvoke() {
+
+    }
+
+    /**
+     * 注意到,方法代理模型 使用静态类型(这对于实现方法是非常好的) ..
+     * 但是严格类型导致限制了代码的重用 ...
+     *
+     * class Loop {
+     *     public String loop(String value) {return value;}
+     *     public int loop(int value) {return value;}
+     * }
+     *
+     * 上面的代码签名很类似但是 具有不同的类型参数,通常你可以不会使用一个拦截器去拦截多个方法,
+     * 而是一个目标方法对应一个拦截器方法(仅仅是为了静态类型匹配) ..
+     * 但是为了代码重用,byte buddy 允许给方法和方法参数注释注解,让byte buddy 暂停静态类型检查(更加喜爱运行时类型cast) ...
+     *
+     * class Interceptor {
+     *   @RuntimeType
+     *   public static Object intercept(@RuntimeType Object value) {
+     *     System.out.println("Invoked method with: " + value);
+     *     return value;
+     *   }
+     * }
+     * 这种是有代价的,虽然我们现在可以用一个方法拦截两个方法调用 .. 但是牺牲了类型安全,随时可能会遇到类型强转异常 ...
+     *
+     * 作为一个等价物(@SuperCall的等价物) ... 你能够使用@DefaultCall注解,它允许 默认方法的执行而不是调用一个超类方法的执行   ..
+     * 具有这个参数注解的方法将被考虑进行绑定(如果这个拦截的方法确实是这样) ...
+     * 通过接口声明的默认方法将会直接被检查类型所实现,类似的,@SuperCall 注解会阻止方法绑定(如果指示的方法并没有定义一个非抽象的父类方法) ..
+     * 如果你想执行一个指定类型的默认方法,你能够指定@DefaultCall的targetType property为特定的接口 ...
+     * 通过这种约定,如果方法存在 ,Byte Buddy 将会注册一个代理实例(当执行给定接口类型的默认方法时) ...
+     * 否则这个具有参数注解的目标方法将不考虑为代理目标 ,特别是默认方法调用仅仅对java 8或者更新的版本定义的类生效 ,类似的
+     * 除了@Super 注解,这里的@Default注解将会注入一个代理用来显式的执行特定的默认方法 ....
+     *
+     * 另外我们可以通过任何MethodDelegation 注册或者定义自定义注解 ..
+     * Byte Buddy 携带了一个可以使用的注解(但是需要显式注册) ..
+     *
+     * 你能够转发一个拦截的方法调用到另一个实例 ...
+     *
+     * @Pipe 注解需要显式注册(因为它在java 8之前声明,在java 8才引入了Function类型,所以我们需要自己提供自定义类型来表达函数 ..
+     * 他需要一个OBject参数,返回一个Object结果 ...当然我们可以使用泛型,只要它能够被Object约束 ..
+     *
+     * 当执行方法的时候,Byte buddy 将根据方法的声明类型强转方法参数并且调用被拦截的方法(使用相同的参数) ..
+     * interface Forwarder<T, S> {
+     *   T to(S target);
+     * }
+     * 这样我们能够实现一个新的解决方式记录日志 通过转发一个方法调用到存在的实例 ..
+     *
+     * 本质上 它无法区分类型 .... 泛型信息丢失了 ... (刚开始学习,还有许多东西都是过了一遍 没有串起来)
+     *
+     */
+    @Test
+    public void strictTypeForMethodInvoke() throws InstantiationException, IllegalAccessException {
+        System.out.println(new ByteBuddy()
+                .subclass(MemoryDatabase.class)
+                .method(named("load")).intercept(MethodDelegation.withDefaultConfiguration()
+                        .withBinders(Pipe.Binder.install(Forwarder.class))
+                        .to(new ForwardingLoggerInterceptor(new MemoryDatabase())))
+                .make()
+                .load(getClass().getClassLoader())
+                .getLoaded()
+                .newInstance()
+                .load("你好"));
+    }
+    public interface Forwarder<T, S> {
+        T to(S target);
+    }
+    public static class ForwardingLoggerInterceptor {
+
+        private final MemoryDatabase memoryDatabase; // constructor omitted
+
+        public ForwardingLoggerInterceptor(MemoryDatabase memoryDatabase) {
+            this.memoryDatabase = memoryDatabase;
+        }
+
+        @BindingPriority(10)
+        public List<String> log(@Pipe Forwarder<List<String>, MemoryDatabase> pipe) {
+            System.out.println("Calling database");
+            try {
+                return pipe.to(memoryDatabase);
+            } finally {
+                System.out.println("Returned from database");
+            }
+        }
+
+        @BindingPriority(20)
+        public List<String> logObject(@Pipe Forwarder<List<String>,Object> objectPipe) {
+            List<String> to = objectPipe.to(memoryDatabase);
+            System.out.println("logObject");
+            return to;
         }
     }
 }

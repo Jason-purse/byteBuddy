@@ -12,7 +12,7 @@ public class LoggerInterceptor {
      * @return
      * @throws Exception
      */
-        public static List<String> log(@SuperCall Callable<List<String>> zsuper) throws Exception {
+        public static List<String> log(@SuperCall Callable<List<String>> zsuper)  throws Exception{
             System.out.println("calling database");
             try {
                 return zsuper.call();
