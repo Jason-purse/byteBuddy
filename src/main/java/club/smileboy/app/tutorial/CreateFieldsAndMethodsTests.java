@@ -2,16 +2,31 @@ package club.smileboy.app.tutorial;
 
 import club.smileboy.app.method.proxy.Foo;
 import net.bytebuddy.ByteBuddy;
-import net.bytebuddy.implementation.FixedValue;
-import net.bytebuddy.implementation.MethodDelegation;
+import net.bytebuddy.ClassFileVersion;
+import net.bytebuddy.description.modifier.Visibility;
+import net.bytebuddy.dynamic.loading.ClassLoadingStrategy;
+import net.bytebuddy.dynamic.scaffold.subclass.ConstructorStrategy;
+import net.bytebuddy.implementation.*;
 import net.bytebuddy.implementation.bind.annotation.BindingPriority;
 import net.bytebuddy.implementation.bind.annotation.Pipe;
 import net.bytebuddy.implementation.bind.annotation.Super;
 import net.bytebuddy.implementation.bind.annotation.SuperCall;
+import net.bytebuddy.matcher.ElementMatchers;
 import org.junit.jupiter.api.Test;
 
+import java.io.BufferedReader;
+import java.io.IOException;
+import java.lang.reflect.InvocationHandler;
 import java.lang.reflect.InvocationTargetException;
+import java.lang.reflect.Method;
 import java.lang.reflect.Modifier;
+import java.nio.ByteBuffer;
+
+import java.nio.channels.AsynchronousFileChannel;
+import java.nio.channels.FileChannel;
+import java.nio.channels.ServerSocketChannel;
+import java.nio.file.Path;
+import java.nio.file.StandardOpenOption;
 import java.util.List;
 
 import static net.bytebuddy.matcher.ElementMatchers.*;
@@ -413,5 +428,184 @@ public class CreateFieldsAndMethodsTests {
             System.out.println("logObject");
             return to;
         }
+    }
+
+
+    /**
+     * 调用超类方法
+     * ConstructorStrategy(构造器策略)负责为任何给定的类创建一组预定义的构造器。除了上面的策略(复制动态类型的直接超类的每一个可见构造器)之外，
+     * 还有三个其它的预定义策略：
+     * 一个不创建任何构造器；
+     * 另一个创建默认的构造器，
+     * 该构造器会调用直接超类的默认构造器，如果没有这样的构造器，则会抛出异常；
+     * 最后一种仅模仿超类的公共构造器
+     *
+     * 在Java类文件格式中，构造器通常与方法没什么区别，这样Byte Buddy允许将它们相同对待。但是，构造器需要包含调用另一个构造器的硬编码调用才能被Java运行时接受。由于这个原因，除了SuperMethodCall，
+     * 大多数预定义实现应用于构造器时将无法创建有效的Java类, 然而可以使用自定义实现 ...
+     * 通过 defineConstructor(定义构造器)方法定义你自己的构造器
+     *
+     * 对于类变基和重定义，构造器当然只是简单地保留，这使得ConstructorStrategy的规范过时了。相反，对于复制这些保留的构造器(和方法)的实现，需要指定一个ClassFileLocator(类文件定位器)，
+     * 它允许查找包含了这些构造器定义的源类。Byte Buddy会尽最大努力识别源类文件的位置，例如，通过查询对应的ClassLoader或者通过查看应用的类路径。
+     * 然而，当处理自定义的类加载器时，查看可能仍然会失败。然后，就要提供一个自定义ClassFileLocator
+     */
+    @Test
+    public void callSuperMethodCall() {
+        // 隐式继承Object的超类调用
+        new ByteBuddy()
+                .subclass(Object.class)
+                .make();
+
+        // 他等价于,也就是直接可以调用父类的构造器 ..
+        new ByteBuddy()
+                .subclass(Object.class, ConstructorStrategy.Default.IMITATE_SUPER_CLASS);
+    }
+
+
+    public interface First {
+        default String qux() { return "FOO"; }
+    }
+
+    public interface Second {
+        default String qux() { return "BAR"; }
+    }
+    /**
+     * 调用默认方法, 需要在默认方法上 指定方法的接口 ... 否则如果方法签名一样,会产生歧义性 ...
+     * Byte Buddy的DefaultMethodCall实现采用了优先接口列表。当拦截一个方法时，DefaultMethodCall将在第一个提到的接口上调用默认方法
+     */
+    @Test
+    public void callDefaultMethodCall() throws InstantiationException, IllegalAccessException {
+        System.out.println(((First) new ByteBuddy(ClassFileVersion.JAVA_V11)
+                .subclass(Object.class)
+                .implement(First.class)
+                .implement(Second.class)
+                // 第一个实现接口的方法优先
+                .method(named("qux")).intercept(DefaultMethodCall.prioritize(First.class))
+                // 找到歧义性方法报错 ...
+//                .method(named("qux")).intercept(DefaultMethodCall.unambiguousOnly())
+                .make()
+                .load(ClassLoader.getSystemClassLoader())
+                .getLoaded()
+                .newInstance())
+                .qux());
+    }
+
+
+    public static class UserType {
+        public String doSomething() { return null; }
+    }
+
+    public interface Interceptor {
+        String doSomethingElse();
+    }
+
+    public interface InterceptionAccessor {
+        Interceptor getInterceptor();
+        void setInterceptor(Interceptor interceptor);
+    }
+
+    public interface InstanceCreator {
+        Object makeInstance();
+    }
+
+    /**
+     * 访问字段
+     * 通过FiledAccessor (字段访问器) 实现方法的读取或者写入
+     *
+     * 必须有 pojo的 setter  / getter ...
+     * 通过FiledAccessor.ofBeanProperty() 创建这样的一个访问器(如果不想从方法名中获取字段名称) ...
+     * FieldAcessor.ofFiled(String)显式定义字段名 .. 如果有需要在没有这个字段的情况下定义一个新的字段 ...
+     * 当访问一个现有字段时通过 in 方法来指定定义字段的类型 ... java中 类继承结构中的多个类定义一个字段是合法的 ...
+     * 这个过程中,一个类的一个字段能够被子类覆盖 ... 否则 byte Buddy 将遍历类结构访问它遇到的第一个字段 ...
+     *
+     * 假设我们想要为UserType 子类化(运行时),于是我们想为每一个接口表示的实例注册一个拦截器,
+     * 根据前面的说法,我们可以将方法调用拦截到对应的字段,然后我们创建基于pojo形式的拦截器field即可,那么它的接口定义必须是
+     * interface Interceptor {
+     *   String doSomethingElse();
+     * },
+     * 对应的属性访问器是
+     * interface InterceptionAccessor {
+     *   Interceptor getInterceptor();
+     *   void setInterceptor(Interceptor interceptor);
+     * }
+     *
+     * 也就是我们的动态类型能够通过java bean 规范进行拦截器获取(通过setter / getter)
+     * 然后我们就可以开始代理了 ...
+     *
+     * 最后我们为实例自定义拦截器 ... 让我们将HelloWorldInteceptor 拦截器应用到 新创建的实例上 ,注意它没有使用反射,而是通过字段访问器接口和工厂 ...
+     *
+     *
+     * 目前除了讨论的实现之外,还包括
+     * StubMethod  (返回存根,也就是返回类型的默认值,这样一个特定的方法调用可以被抑制,实现mock 模型, 引用类型的方法返回 null)
+     *
+     * ExceptionMethod 只抛出异常的方法, 可以从任何方法抛出已检查异常,即使这个方法没有声明这个异常 ..
+     *
+     * Forwarding 实现允许简单的调用转发到另一个与拦截方法的声明类型相同的方法, 当然 MethodDelegation 可以达到相同的效果,通过Forwarding 应用更简单的模型, 该模型可以覆盖不需要目标方法发现的用例 ...
+     *
+     * InvocationHandlerAdapter 允许使用Java的类库进行代理 ..
+     *
+     * InvokeDynamic 允许使用 引导方法(bootstrap)运行时动态绑定一个方法,这个方法可以从Java 7 开始访问 ...
+     */
+    @Test
+    public void visitField() throws InstantiationException, IllegalAccessException, IOException {
+        Class<? extends UserType> loaded = new ByteBuddy()
+                .subclass(UserType.class)
+                .method(not(isDeclaredBy(Object.class)))
+                .intercept(MethodDelegation.toField("interceptor"))
+                .defineField("interceptor", Interceptor.class, Visibility.PRIVATE)
+                .implement(InterceptionAccessor.class)
+                .intercept(FieldAccessor.ofBeanProperty())
+                .make()
+                .load(ClassLoader.getSystemClassLoader(), ClassLoadingStrategy.Default.WRAPPER)
+                .getLoaded();
+
+             // 于是使用新的动态userType,我们可以实现InstanceCreator 接口作为这个动态类型的工厂 ... 我们通过MethodDelegation 进行动态类型的默认构造器 调用 ..
+        // 相当于 调用这个实例的方法,就相当于创建对象 ...
+        // 注意我们需要使用动态用户类型的类加载器加载这个工厂,否则这个类型加载后对这个工厂不可见 ...
+        InstanceCreator instanceCreator = new ByteBuddy()
+                .subclass(InstanceCreator.class)
+                .method(not(isDeclaredBy(Object.class)))
+                .intercept(MethodDelegation.toConstructor(loaded))
+                .make()
+                // 如果两者加载是使用不同的类加载器,可能动态类对工厂不可见 ..
+//                .load(ClassLoader.getSystemClassLoader())
+                .load(loaded.getClassLoader())
+                .getLoaded().newInstance();
+
+        InterceptionAccessor o = (InterceptionAccessor) instanceCreator.makeInstance();
+        System.out.println(o);
+
+        class HelloWorldInterceptor implements Interceptor {
+            @Override
+            public String doSomethingElse() {
+                return "Hello World!";
+            }
+        }
+
+        o.setInterceptor(new HelloWorldInterceptor());
+        UserType o1 = (UserType) o;
+        System.out.println(o1.doSomething());
+
+    }
+
+    @Test
+    public void proxyByInvokeHandler() throws InstantiationException, IllegalAccessException {
+
+        String s = new String("百度");
+        System.out.println(new ByteBuddy()
+                .subclass(Object.class)
+                .method(any())
+                .intercept(InvocationHandlerAdapter.of(new InvocationHandler() {
+                    @Override
+                    public Object invoke(Object proxy, Method method, Object[] args) throws Throwable {
+                        System.out.println("执行方法");
+                        // pass
+                        return method.invoke(s, args);
+                    }
+                }))
+                .make()
+                .load(ClassLoader.getSystemClassLoader())
+                .getLoaded()
+                .newInstance()
+                .toString());
     }
 }
